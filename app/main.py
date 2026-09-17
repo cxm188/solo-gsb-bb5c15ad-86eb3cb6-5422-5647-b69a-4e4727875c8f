@@ -22,10 +22,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from . import audit, config
+from . import audit, config, simulation
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
-from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest
+from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest, SimulationRequest
 
 logger = logging.getLogger("quota")
 
@@ -337,6 +337,90 @@ def _release_consumption(
         "released_buckets": payload["buckets"],
         "events_reverted": deleted,
         "released_at": now,
+    }
+
+
+# ---------------------------------------------------------------- 回放模拟
+
+@app.post("/v1/quota/simulations")
+def simulate_quota(req: SimulationRequest):
+    """在隔离内存中回放历史消费，评估候选桶配置的判定变化。
+
+    给定 epoch 秒区间 ``[from, to)`` 与若干桶的候选
+    ``limit/window_seconds``（未覆盖桶沿用当前配置），从 ``from`` 向前
+    取各桶生效窗口最大值作为预热期，按 ``(created_at, request_id)``
+    稳定顺序读取**首次消费**固化载荷重放滚动过期与多桶全放行/全拒绝。
+    仅回放消费、不处理 release；全程只读，不写数据库也不追加审计链。
+
+    - 200：返回实际判定 → 模拟判定的转移计数、每桶模拟峰值与前 100 条
+      判定翻转明细；
+    - 422：未知桶、候选桶重复、``from >= to`` 或跨度超过 7 天。
+    """
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT key, limit_amount, window_seconds FROM buckets"
+        ).fetchall()
+        db_configs = {
+            r["key"]: (r["limit_amount"], float(r["window_seconds"])) for r in rows
+        }
+        overrides = [o.model_dump() for o in req.buckets]
+        try:
+            override_cfg = simulation.validate_request(
+                req.from_, req.to, overrides, set(db_configs)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        effective = simulation.resolve_configs(db_configs, override_cfg)
+        warmup = simulation.warmup_seconds(effective)
+
+        # 预热起点（含）：[from - max_window, to)；只读、不开写事务
+        history = conn.execute(
+            """
+            SELECT created_at, request_id, payload, allowed
+              FROM requests
+             WHERE created_at >= ? AND created_at < ?
+             ORDER BY created_at ASC, request_id ASC
+            """,
+            (req.from_ - warmup, float(req.to)),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    records = []
+    for r in history:
+        items = merge_items(json.loads(r["payload"])["buckets"])
+        # 历史载荷引用的桶必须仍有生效配置（防御已删除桶的陈旧固化记录）
+        missing = [it["key"] for it in items if it["key"] not in effective]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"历史消费 {r['request_id']} 引用了未知/已删除桶 "
+                    f"{sorted(missing)}，无法回放"
+                ),
+            )
+        records.append((r["created_at"], r["request_id"], items,
+                        bool(r["allowed"])))
+    result = simulation.run_simulation(records, effective, float(req.from_))
+
+    return {
+        "from": req.from_,
+        "to": req.to,
+        "warmup_seconds": warmup,
+        "effective_buckets": [
+            {"key": k, "limit": lim, "window_seconds": win}
+            for k, (lim, win) in sorted(effective.items())
+        ],
+        "transitions": result["transitions"],
+        "bucket_peaks": [
+            {"key": k, "simulated_peak": peak}
+            for k, peak in result["bucket_peaks"].items()
+        ],
+        "flip_details": result["flips"],
+        "flip_details_truncated": result["flip_truncated"],
+        "warmup_records": result["warmup_records"],
+        "records_replayed": result["records_replayed"],
     }
 
 

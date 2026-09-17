@@ -1,4 +1,4 @@
-"""端到端测试：原子扣减、幂等、409、并发不超限、滚动窗口恢复。"""
+"""端到端测试：原子扣减、幂等、409、并发不超限、滚动窗口恢复、配置回放模拟。"""
 import json
 import os
 import tempfile
@@ -703,3 +703,346 @@ def test_audit_verify_detects_tampering():
 
     assert client.get("/v1/audit/verify").json()["valid"] is True
 
+
+# ---------------------------------------------------------------- 回放模拟
+
+def _insert_request(rid: str, key: str, amount: int, created_at: float,
+                    allowed: bool):
+    """直接写入一条历史消费固化记录（绕过 created_at=now）。
+
+    模拟只读取 requests 表中首次消费固化的载荷与判定，不依赖
+    usage_events，因此这里只构造 requests 记录。
+    """
+    from app.db import connect
+
+    payload = {"request_id": rid,
+               "buckets": [{"key": key, "amount": amount}]}
+    decision = {"request_id": rid, "allowed": allowed,
+                "decided_at": created_at}
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO requests (request_id, payload_hash, payload, "
+            "decision, allowed, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, "0" * 64, json.dumps(payload), json.dumps(decision),
+             1 if allowed else 0, created_at),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _insert_request_multi(rid: str, items: list[dict], created_at: float,
+                          allowed: bool):
+    from app.db import connect
+
+    payload = {"request_id": rid, "buckets": items}
+    decision = {"request_id": rid, "allowed": allowed,
+                "decided_at": created_at}
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO requests (request_id, payload_hash, payload, "
+            "decision, allowed, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, "0" * 64, json.dumps(payload), json.dumps(decision),
+             1 if allowed else 0, created_at),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _simulate(payload: dict):
+    return client.post("/v1/quota/simulations", json=payload)
+
+
+def test_simulation_transitions_and_effective_config():
+    """allow→allow / allow→deny / deny→deny 转移计数、生效配置与峰值。"""
+    key = _bucket(10, 100.0)
+    base = 1_000_000
+    # 预热：t=950 放行 8；窗口 100，在 t=1000 仍占用
+    _insert_request("sim-w", key, 8, base - 50, True)
+    # 区间内：放行 1（9/10）、再放行 1（10/10）、
+    # 实际拒绝且模拟仍拒绝 1 笔、实际放行但模拟拒绝 1 笔
+    _insert_request("sim-a", key, 1, base + 10, True)
+    _insert_request("sim-b", key, 1, base + 20, True)
+    _insert_request("sim-c", key, 1, base + 30, False)
+    _insert_request("sim-d", key, 1, base + 40, True)
+
+    r = _simulate({"from": base, "to": base + 100,
+                   "buckets": [{"key": key, "limit": 10,
+                                "window_seconds": 100}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["from"] == base and body["to"] == base + 100
+    assert body["warmup_seconds"] == max(
+        b["window_seconds"] for b in body["effective_buckets"]
+    )
+    eff = {b["key"]: b for b in body["effective_buckets"]}
+    assert eff[key] == {"key": key, "limit": 10, "window_seconds": 100.0}
+    assert body["transitions"] == {
+        "allowed_to_allowed": 2,
+        "allowed_to_denied": 1,
+        "denied_to_allowed": 0,
+        "denied_to_denied": 1,
+    }
+    # 模拟峰值：8（预热残留）+1+1 = 10；被拒请求不占用
+    peaks = {p["key"]: p["simulated_peak"] for p in body["bucket_peaks"]}
+    assert peaks == {key: 10}
+    assert body["records_replayed"] == 4
+    assert body["warmup_records"] == 1
+    assert body["flip_details_truncated"] is False
+
+    flip = body["flip_details"][0]
+    assert flip["request_id"] == "sim-d"
+    assert flip["created_at"] == base + 40
+    assert flip["actual_decision"] == "allowed"
+    assert flip["simulated_decision"] == "denied"
+    assert flip["buckets"] == [{"key": key, "amount": 1}]
+
+
+def test_simulation_denied_to_allowed_on_window_shrink():
+    """候选窗口变小：实际满窗拒绝的请求在模拟中窗口已滚动放行。"""
+    key = _bucket(1, 100.0)
+    base = 2_000_000
+    # 预热事件早于候选窗口(50s)、但在实际窗口(100s)内：
+    # 实际 t=base 时它仍占用 → simx-deny 被拒；模拟窗口 50s 已过期 → 放行
+    _insert_request("simx-old", key, 1, base - 70, True)
+    _insert_request("simx-deny", key, 1, base, False)
+    _insert_request("simx-ok", key, 1, base + 60, True)
+
+    r = _simulate({"from": base, "to": base + 100,
+                   "buckets": [{"key": key, "limit": 1,
+                                "window_seconds": 50}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 预热期取全部生效桶窗口的最大值（保守覆盖），不短于候选窗口
+    assert body["warmup_seconds"] >= 50
+    assert body["warmup_seconds"] == max(
+        b["window_seconds"] for b in body["effective_buckets"]
+    )
+    assert body["warmup_records"] == 1
+    assert body["transitions"] == {
+        "allowed_to_allowed": 1,
+        "allowed_to_denied": 0,
+        "denied_to_allowed": 1,
+        "denied_to_denied": 0,
+    }
+    flips = body["flip_details"]
+    assert len(flips) == 1
+    assert flips[0]["request_id"] == "simx-deny"
+    assert flips[0]["actual_decision"] == "denied"
+    assert flips[0]["simulated_decision"] == "allowed"
+
+
+def test_simulation_uncovered_bucket_keeps_current_config():
+    """未给候选的桶沿用当前配置。"""
+    key = _bucket(3, 100.0)
+    base = 3_000_000
+    _insert_request("keep-a", key, 3, base + 1, True)
+    _insert_request("keep-b", key, 1, base + 2, False)
+
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    eff = {b["key"]: b for b in body["effective_buckets"]}
+    assert eff[key] == {"key": key, "limit": 3, "window_seconds": 100.0}
+    assert body["transitions"] == {
+        "allowed_to_allowed": 1,
+        "allowed_to_denied": 0,
+        "denied_to_allowed": 0,
+        "denied_to_denied": 1,
+    }
+    assert body["flip_details"] == []
+    assert {p["key"]: p["simulated_peak"]
+            for p in body["bucket_peaks"]} == {key: 3}
+
+
+def test_simulation_releases_are_not_replayed():
+    """模拟只回放消费：已释放的预热消费仍占用模拟额度（release 被忽略）。"""
+    key = _bucket(1, 100.0)
+    base = 4_000_000
+    _insert_request("rel-old", key, 1, base - 10, True)
+    # 线上随后释放 rel-old，使 rel-new 实际得以放行
+    assert _release("rel-1", "rel-old").status_code == 200
+    _insert_request("rel-new", key, 1, base + 5, True)
+
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["warmup_records"] == 1
+    assert body["transitions"]["allowed_to_denied"] == 1
+    assert body["transitions"]["allowed_to_allowed"] == 0
+    flip = body["flip_details"][0]
+    assert flip["request_id"] == "rel-new"
+    assert flip["actual_decision"] == "allowed"
+    assert flip["simulated_decision"] == "denied"
+
+
+def test_simulation_multi_bucket_all_or_nothing():
+    """多桶请求：任一桶超限则模拟整体拒绝、所有桶均不占用。"""
+    k1, k2 = _bucket(5, 100.0), _bucket(5, 100.0)
+    base = 5_000_000
+    _insert_request_multi("mb-1", [{"key": k1, "amount": 5},
+                                   {"key": k2, "amount": 5}], base + 1, True)
+    _insert_request_multi("mb-2", [{"key": k1, "amount": 1},
+                                   {"key": k2, "amount": 1}], base + 2, True)
+
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    assert r.status_code == 200, r.text
+    t = r.json()["transitions"]
+    assert t["allowed_to_allowed"] == 1
+    assert t["allowed_to_denied"] == 1
+    peaks = {p["key"]: p["simulated_peak"]
+             for p in r.json()["bucket_peaks"]}
+    # mb-2 被整体拒绝，两桶峰值都停留在 5
+    assert peaks == {k1: 5, k2: 5}
+    flip = r.json()["flip_details"][0]
+    assert flip["request_id"] == "mb-2"
+    assert sorted(b["key"] for b in flip["buckets"]) == sorted([k1, k2])
+
+
+def test_simulation_warmup_boundary():
+    """恰好落在预热起点的事件在区间开始时已过期。"""
+    key = _bucket(100, 100.0)
+    base = 6_000_000
+    _insert_request("wb-edge", key, 5, base - 100, True)   # t=from-window
+    _insert_request("wb-in", key, 3, base + 1, True)
+
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    body = r.json()
+    assert body["warmup_records"] == 1
+    peaks = {p["key"]: p["simulated_peak"] for p in body["bucket_peaks"]}
+    assert peaks[key] == 3
+
+
+def test_simulation_flip_details_stable_order_and_limit():
+    """翻转明细按 (created_at, request_id) 稳定顺序，最多 100 条。"""
+    key = _bucket(1, 1000.0)
+    base = 7_000_000
+    # 同秒内 request_id 决定顺序：a 放行，b、c 及之后全部在模拟中翻转
+    for i, rid in enumerate(["sa", "sb", "sc"] + [f"s{i:03d}" for i in range(120)]):
+        _insert_request(rid, key, 1, float(base + i), True)
+
+    r = _simulate({"from": base, "to": base + 1000, "buckets": []})
+    body = r.json()
+    # 首条 allowed→allowed，其余 122 条全部 allowed→denied
+    assert body["transitions"]["allowed_to_allowed"] == 1
+    assert body["transitions"]["allowed_to_denied"] == 122
+    assert len(body["flip_details"]) == 100
+    assert body["flip_details_truncated"] is True
+    # 稳定顺序：先按时间（首条翻转是同秒的 sb，而非更晚的记录）
+    assert body["flip_details"][0]["request_id"] == "sb"
+    assert body["flip_details"][1]["request_id"] == "sc"
+    ordered = [(f["created_at"], f["request_id"]) for f in body["flip_details"]]
+    assert ordered == sorted(ordered)
+
+
+def test_simulation_is_read_only():
+    """模拟不写业务数据也不追加审计链。"""
+    before_req = client.get("/v1/audit/verify").json()["checked_count"]
+    key = _bucket(2, 100.0)
+    base = 8_000_000
+    _insert_request("ro-1", key, 1, base + 1, True)
+
+    usage_before = client.get(f"/v1/buckets/{key}/usage").json()["used"]
+    r = _simulate({"from": base, "to": base + 100,
+                   "buckets": [{"key": key, "limit": 1,
+                                "window_seconds": 10}]})
+    assert r.status_code == 200
+    # 桶配置未被候选覆盖
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == usage_before
+    cfg = client.get("/v1/buckets").json()["buckets"]
+    assert {b["key"]: (b["limit"], b["window_seconds"]) for b in cfg
+            if b["key"] == key} == {key: (2, 100.0)}
+    assert client.get("/v1/audit/verify").json()["checked_count"] == before_req
+
+
+def test_simulation_validation_errors():
+    """未知桶/非法范围/跨度超 7 天/候选重复 → 422。"""
+    key = _bucket(1, 60.0)
+
+    assert _simulate({"from": 100, "to": 90, "buckets": []}).status_code == 422
+    assert _simulate({"from": 100, "to": 100, "buckets": []}).status_code == 422
+    assert _simulate({
+        "from": 0, "to": 7 * 24 * 3600 + 1, "buckets": [],
+    }).status_code == 422
+    # 恰好 7 天合法
+    assert _simulate({
+        "from": 0, "to": 7 * 24 * 3600, "buckets": [],
+    }).status_code == 200
+    # 未知桶
+    assert _simulate({"from": 0, "to": 100, "buckets": [
+        {"key": "not-a-bucket", "limit": 1, "window_seconds": 60},
+    ]}).status_code == 422
+    # 候选桶重复
+    assert _simulate({"from": 0, "to": 100, "buckets": [
+        {"key": key, "limit": 1, "window_seconds": 60},
+        {"key": key, "limit": 2, "window_seconds": 60},
+    ]}).status_code == 422
+    # 候选值非法（pydantic）
+    assert _simulate({"from": 0, "to": 100, "buckets": [
+        {"key": key, "limit": 0, "window_seconds": 60},
+    ]}).status_code == 422
+    # 缺少必填字段
+    assert _simulate({"to": 100, "buckets": []}).status_code == 422
+
+
+def test_simulation_empty_range():
+    """区间内无任何记录：转移全 0、峰值为空，预热仍正常执行。"""
+    key = _bucket(1, 60.0)
+    _insert_request("far-away", key, 1, 50.0, True)
+    r = _simulate({"from": 9_000_000, "to": 9_000_100, "buckets": []})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["transitions"].values()) == {0}
+    assert body["bucket_peaks"] == []
+    assert body["flip_details"] == []
+    assert body["warmup_records"] == 0
+    assert body["records_replayed"] == 0
+
+
+def test_simulation_peak_includes_warmup_residual_on_denials():
+    """区间内请求全部被模拟拒绝时，峰值仍反映预热残留占用。"""
+    key = _bucket(10, 100.0)
+    base = 10_000_000
+    _insert_request("res-w", key, 7, base - 10, True)   # 区间起点仍残留 7
+    _insert_request("res-1", key, 4, base + 1, True)    # 模拟拒绝
+    _insert_request("res-2", key, 4, base + 2, False)   # 模拟仍拒绝
+
+    r = _simulate({"from": base, "to": base + 100,
+                   "buckets": [{"key": key, "limit": 10,
+                                "window_seconds": 100}]})
+    assert r.status_code == 200, r.text
+    peaks = {p["key"]: p["simulated_peak"]
+             for p in r.json()["bucket_peaks"]}
+    # 两次判定时刻占用均为 7（预热残留），峰值 7
+    assert peaks == {key: 7}
+
+
+def test_simulation_stale_payload_unknown_bucket_422():
+    """历史固化载荷引用已不存在的桶：无法回放，422 且不留痕。"""
+    from app.db import connect
+
+    ghost = f"ghost-{_rid()[:10]}"
+    assert client.put(f"/v1/buckets/{ghost}", json={
+        "limit": 1, "window_seconds": 60,
+    }).status_code == 200
+    base = 11_000_000
+    _insert_request("ghost-1", ghost, 1, base + 1, True)
+    # 直接删除桶（无删除接口），模拟时历史载荷引用即失效
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM buckets WHERE key = ?", (ghost,))
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    before = client.get("/v1/audit/verify").json()["checked_count"]
+    r = _simulate({"from": base, "to": base + 100, "buckets": []})
+    assert r.status_code == 422
+    assert ghost in r.json()["detail"]
+    assert client.get("/v1/audit/verify").json()["checked_count"] == before

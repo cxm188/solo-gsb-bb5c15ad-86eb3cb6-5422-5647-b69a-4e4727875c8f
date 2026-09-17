@@ -22,3 +22,22 @@ class ReleaseRequest(BaseModel):
 class BucketConfig(BaseModel):
     limit: int = Field(gt=0, le=2**31 - 1)
     window_seconds: float = Field(gt=0, le=365 * 24 * 3600)
+
+
+class SimulationBucketOverride(BaseModel):
+    """模拟时覆盖某个桶的候选 limit/window_seconds（必须成对给出）。"""
+
+    key: str = Field(min_length=1, max_length=128)
+    limit: int = Field(gt=0, le=2**31 - 1)
+    window_seconds: float = Field(gt=0, le=365 * 24 * 3600)
+
+
+class SimulationRequest(BaseModel):
+    """配额回放模拟请求：epoch 秒区间 [from, to) 与若干桶的候选配置。"""
+
+    # from 是 Python 关键字，字段名取 from_ 并以 "from" 作为对外别名
+    from_: int = Field(alias="from", ge=0)
+    to: int = Field(ge=0)
+    buckets: list[SimulationBucketOverride] = Field(default_factory=list, max_length=100)
+
+    model_config = {"populate_by_name": True}
