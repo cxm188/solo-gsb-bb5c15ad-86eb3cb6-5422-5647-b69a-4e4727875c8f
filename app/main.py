@@ -25,7 +25,8 @@ from fastapi.responses import JSONResponse
 from . import audit, config
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
-from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest
+from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest, SimulationRequest
+from . import simulation as sim_engine
 
 logger = logging.getLogger("quota")
 
@@ -338,6 +339,81 @@ def _release_consumption(
         "events_reverted": deleted,
         "released_at": now,
     }
+
+
+# ---------------------------------------------------------------- 配额配置模拟
+
+@app.post("/v1/quota/simulations")
+def run_simulation(req: SimulationRequest):
+    """在隔离内存中回放历史消费，评估候选桶配置的判定差异。
+
+    全程只读数据库，不写任何业务数据、不追加审计记录；release 不回放。
+
+    - 200：返回区间内原始判定 → 模拟判定的转移计数、每桶模拟峰值与
+      前 100 条判定翻转明细；
+    - 422：候选桶未配置 / from >= to / 区间跨度超过 7 天 / 候选桶重复。
+    """
+    start = float(req.from_)
+    end = float(req.to)
+    if start >= end:
+        raise HTTPException(
+            status_code=422,
+            detail=f"非法区间：from({req.from_}) 必须严格小于 to({req.to})",
+        )
+    if end - start > sim_engine.MAX_RANGE_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"区间跨度 {int(end - start)} 秒超过上限 "
+                f"{sim_engine.MAX_RANGE_SECONDS} 秒（7 天）"
+            ),
+        )
+
+    candidate: dict[str, tuple[int, float]] = {}
+    for b in req.buckets:
+        if b.key in candidate:
+            raise HTTPException(
+                status_code=422,
+                detail=f"候选桶 '{b.key}' 重复，每个桶至多给出一份候选配置",
+            )
+        candidate[b.key] = (b.limit, b.window_seconds)
+
+    conn = connect()
+    try:
+        # 模拟配置：候选覆盖当前配置，未覆盖桶沿用当前配置
+        rows_cfg = conn.execute(
+            "SELECT key, limit_amount, window_seconds FROM buckets"
+        ).fetchall()
+        configs: dict[str, tuple[int, float]] = {
+            r["key"]: (r["limit_amount"], r["window_seconds"]) for r in rows_cfg
+        }
+        unknown = [k for k in candidate if k not in configs]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"未知桶 {sorted(unknown)}：候选桶必须已存在，"
+                    "请先通过 PUT /v1/buckets/{key} 创建"
+                ),
+            )
+        configs.update(candidate)
+
+        warm_start = sim_engine.warm_start_for(configs, start)
+        # 仅回放消费（requests 固化的首次载荷）；release_id 非空的消费已被
+        # 释放，模拟时同样跳过。按 (created_at, request_id) 稳定排序。
+        rows = conn.execute(
+            """
+            SELECT request_id, created_at, payload, allowed, release_id
+              FROM requests
+             WHERE created_at >= ? AND created_at < ?
+             ORDER BY created_at ASC, request_id ASC
+            """,
+            (warm_start, end),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return sim_engine.simulate(rows, configs=configs, start=start, end=end)
 
 
 # ---------------------------------------------------------------- 哈希审计链

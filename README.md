@@ -15,6 +15,8 @@
 - **用量查询**：随时查询桶当前窗口用量
 - **哈希审计链**：首次判定（放行/拒绝）与首次成功释放均在各自原事务内追加
   一条 SHA-256 哈希链记录，幂等重放不重复记录；提供按 `seq` 翻页查询与全链重算校验
+- **配置模拟**：`POST /v1/quota/simulations` 在隔离内存中回放历史消费，
+  评估候选桶配置（未覆盖桶沿用当前配置）下的判定翻转与峰值，纯只读、不写审计
 
 ## 快速启动
 
@@ -209,12 +211,73 @@ curl http://localhost:8000/v1/audit/verify
 
 发现篡改/断链时 `valid` 为 `false`，`first_invalid_seq` 给出最早失配记录的 `seq`。
 
+### 6. 配额配置模拟（What-if 回放，不写库）
+
+`POST /v1/quota/simulations` 对一段历史时间做"假如当时使用候选桶配置"的
+离线推演：在**隔离内存**中按 `(created_at, request_id)` 稳定顺序回放区间前
+的预热消费与区间内的首次消费，比较每条消费的**原始固化判定**与**模拟重算
+判定**。全程只读数据库，**不写任何数据、不追加审计链**；release 不回放
+（已释放的消费视为从未占额）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `from` / `to` | epoch 秒半开区间 `[from, to)`；`from >= to` 或跨度超过 **7 天** 返回 `422` |
+| `buckets` | 候选配置数组，每项 `{"key", "limit", "window_seconds"}`；**未覆盖桶沿用当前配置**；未知桶、同桶重复给出候选返回 `422` |
+
+预热期：从 `from` 向前取"各桶（候选覆盖后的）窗口最大值"作为预热长度，
+`[from - max_window, from)` 内的消费只用于建立滚动窗口状态，**不计任何统计**。
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/simulations \
+  -H 'Content-Type: application/json' \
+  -d '{"from": 1789650000, "to": 1789653600,
+       "buckets": [{"key": "llm-tokens", "limit": 5000, "window_seconds": 60}]}'
+```
+
+```json
+{
+  "from": 1789650000,
+  "to": 1789653600,
+  "warmup_from": 1789649700,
+  "transitions": {
+    "allowed_to_allowed": 132,
+    "allowed_to_denied": 7,
+    "denied_to_allowed": 2,
+    "denied_to_denied": 1
+  },
+  "peak_usage": [
+    {"key": "api-requests", "limit": 100, "window_seconds": 60, "peak_used": 84},
+    {"key": "llm-tokens", "limit": 5000, "window_seconds": 60, "peak_used": 4950}
+  ],
+  "flip_count": 9,
+  "flip_details": [
+    {"request_id": "req-021", "created_at": 1789650612.83,
+     "original": "allowed", "simulated": "denied",
+     "buckets": [{"key": "llm-tokens", "amount": 500}]},
+    {"request_id": "req-044", "created_at": 1789651220.07,
+     "original": "denied", "simulated": "allowed",
+     "buckets": [{"key": "llm-tokens", "amount": 200}]}
+  ]
+}
+```
+
+- `transitions`：按 `allowed→allowed`、`allowed→denied`、`denied→allowed`、
+  `denied→denied` 顺序给出区间内消费的原始/模拟判定计数；
+- `peak_usage`：每桶在模拟世界中的区间滚动窗口峰值用量（仅列出区间内
+  被请求过的桶）；
+- `flip_details`：判定发生翻转的消费明细，按回放顺序（`created_at`、再
+  `request_id` 升序）截取的**前 100 条**；`flip_count` 为翻转总数（可能大于
+  返回条数）。多桶请求仍遵循 all-or-nothing：任一桶超限则全部不放行。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/v1/quota/consume` | 多桶检查 + 扣减；`200` 放行 / `429` 超限 / `409` 幂等冲突 / `404` 桶未配置 |
 | `POST` | `/v1/quota/releases` | 释放一次已放行消费；`200` 成功或重放 / `409` 冲突 / `404` 原请求不存在 |
+| `POST` | `/v1/quota/simulations` | 候选桶配置的区间历史回放（只读内存模拟）；`200` 结果 / `422` 未知桶、非法范围、跨度超 7 天或候选重复 |
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
 | `GET` | `/v1/buckets` | 列出全部桶配置 |
@@ -254,6 +317,12 @@ curl http://localhost:8000/v1/audit/verify
   的创世前序哈希起逐条重算，同时核对 `seq` 连续性，报告首个失配位置。
 - **最早重试时间**：按窗口内事件过期时刻累计释放量，找到最早可容纳本次请求的过期点；
   多桶受限时取各桶的最大值。
+- **配置模拟**：`POST /v1/quota/simulations` 不开写事务，只用只读连接读取
+  `buckets` 与 `requests`（含固化载荷、原始判定、`release_id`），在
+  `app/simulation.py` 的纯内存状态机中重算滚动过期与多桶 all-or-nothing
+  判定。预热起点取所有已配置桶候选/当前窗口的最大值，预热记录只更新状态、
+  不计统计；`release_id` 非空的已释放消费跳过（release 不回放）。接口对
+  数据库与审计链零写入，重复调用结果一致。
 
 ## 测试
 
@@ -267,4 +336,9 @@ python -m pytest tests/ -q
 幂等重放、改指冲突、重复释放冲突、404/409 分支、释放后 consume 重放不再次扣减、
 20 并发释放仅一个成功；此外覆盖哈希审计链的哈希规则纯函数、首条锚定 64 个 0、
 放行/拒绝/成功释放仅记一次且重放不重复、失败释放与 409/404 不留痕、分页与链头、
-全链校验有效与篡改检出（事件内容/前序指针）等共 36 个用例。
+全链校验有效与篡改检出（事件内容/前序指针）等用例；`tests/test_simulation.py`
+另覆盖配置模拟的 422 校验（未知桶/非法区间/超 7 天/候选重复）、空区间、
+收紧/放宽限额带来的四类判定转移、预热期只建状态不计统计与边界过期、
+区间前记录忽略、模拟内滚动过期、多桶全放行/全拒绝、未覆盖桶沿用当前配置、
+翻转明细按 `(created_at, request_id)` 排序并截断 100 条、已释放消费不回放，
+以及重复模拟不写库/不追加审计链，共 56 个用例。
